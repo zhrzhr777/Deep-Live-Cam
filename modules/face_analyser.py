@@ -5,6 +5,7 @@ import insightface
 import threading
 
 import modules.globals
+import modules.runtime_profile as runtime_profile
 from modules import imread_unicode, imwrite_unicode
 from tqdm import tqdm
 from modules.typing import Frame
@@ -18,13 +19,38 @@ FACE_ANALYSER_LOCK = threading.Lock()
 DET_SIZE = (640, 640)
 
 
+def _apply_runtime_session_options(session_options) -> None:
+    """Tune ORT session options for CUDA / low-vram stability.
+
+    We do this at the detection-model layer because insightface exposes the
+    underlying ONNX sessions there, and it allows us to keep the public API
+    unchanged while reducing memory spikes and thread contention.
+    """
+    import onnxruntime
+
+    profile = runtime_profile.get_runtime_profile()
+    cpu_count = os.cpu_count() or 1
+    if profile["low_vram"]:
+        session_options.intra_op_num_threads = max(1, min(2, cpu_count))
+    else:
+        session_options.intra_op_num_threads = max(1, cpu_count)
+    session_options.inter_op_num_threads = max(1, profile["ort_inter_threads"])
+    session_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+    session_options.enable_cpu_mem_arena = True
+    session_options.enable_mem_pattern = not profile["low_vram"]
+    session_options.graph_optimization_level = (
+        onnxruntime.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        if profile["low_vram"]
+        else onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    )
+
+
 def get_face_analyser() -> Any:
     """Get face analyser with thread-safe initialization."""
     global FACE_ANALYSER
 
     if FACE_ANALYSER is None:
         with FACE_ANALYSER_LOCK:
-            # Double-check after acquiring lock
             if FACE_ANALYSER is None:
                 from modules.processors.frame._onnx_enhancer import (
                     build_provider_config,
@@ -49,6 +75,19 @@ def _optimize_det_model(fa: Any, providers) -> None:
     """
     from modules.onnx_optimize import optimize_for_coreml, IS_APPLE_SILICON
     if not IS_APPLE_SILICON:
+        # Keep a conservative, memory-safe ORT config even on CUDA systems.
+        det_model = fa.det_model
+        model_path = getattr(det_model, 'model_file', None)
+        if model_path is None or not os.path.exists(model_path):
+            return
+        import onnxruntime
+        session_options = onnxruntime.SessionOptions()
+        _apply_runtime_session_options(session_options)
+        det_model.session = onnxruntime.InferenceSession(
+            model_path,
+            sess_options=session_options,
+            providers=providers,
+        )
         return
 
     det_model = fa.det_model
@@ -63,14 +102,8 @@ def _optimize_det_model(fa: Any, providers) -> None:
 
     import onnxruntime
     session_options = onnxruntime.SessionOptions()
-    session_options.graph_optimization_level = (
-        onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-    )
+    _apply_runtime_session_options(session_options)
 
-    # Route detection to GPU shader cores (CPUAndGPU) instead of ANE.
-    # This lets detection run concurrently with the swap model on the
-    # ANE, overlapping the two inference calls.  Detection is fast
-    # enough on GPU (~4ms) and this frees ANE for the heavier swap.
     det_providers = []
     for p in providers:
         name = p[0] if isinstance(p, tuple) else p
@@ -97,7 +130,7 @@ def _needs_landmark() -> bool:
         return True
     processors = getattr(modules.globals, "frame_processors", [])
     return any(p in processors for p in
-               ("face_enhancer", "face_enhancer_gpen256", "face_enhancer_gpen512"))
+                ("face_enhancer", "face_enhancer_gpen256", "face_enhancer_gpen512"))
 
 
 def _is_dml() -> bool:
@@ -160,6 +193,7 @@ def get_many_faces(frame: Frame) -> Any:
     except IndexError:
         return None
 
+
 def detect_one_face_fast(frame: Frame) -> Any:
     """Detection-only — skips landmark and recognition models.
 
@@ -207,12 +241,10 @@ def ensure_landmarks(frame: Frame, faces: Any) -> None:
     for face in faces:
         if face is None:
             continue
-        # insightface Face is a dict; missing keys raise AttributeError,
-        # so getattr(..., None) is the safe presence check.
         if getattr(face, "landmark_2d_106", None) is None:
             try:
                 lmk_model.get(frame, face)
-            except Exception as e:  # pragma: no cover - never break the swap
+            except Exception as e:
                 print(f"Error computing 2d106 landmarks: {e}")
 
 
@@ -222,11 +254,13 @@ def has_valid_map() -> bool:
             return True
     return False
 
+
 def default_source_face() -> Any:
     for map in modules.globals.source_target_map:
         if "source" in map:
             return map['source']['face']
     return None
+
 
 def simplify_maps() -> Any:
     centroids = []
@@ -239,6 +273,7 @@ def simplify_maps() -> Any:
     modules.globals.simple_map = {'source_faces': faces, 'target_embeddings': centroids}
     return None
 
+
 def add_blank_map() -> Any:
     try:
         max_id = -1
@@ -250,7 +285,8 @@ def add_blank_map() -> Any:
                 })
     except ValueError:
         return None
-    
+
+
 def get_unique_faces_from_target_image() -> Any:
     try:
         modules.globals.source_target_map = []
@@ -263,7 +299,7 @@ def get_unique_faces_from_target_image() -> Any:
         for face in many_faces:
             x_min, y_min, x_max, y_max = face['bbox']
             modules.globals.source_target_map.append({
-                'id' : i, 
+                'id' : i,
                 'target' : {
                             'cv2' : target_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
                             'face' : face
@@ -272,14 +308,14 @@ def get_unique_faces_from_target_image() -> Any:
             i = i + 1
     except ValueError:
         return None
-    
-    
+
+
 def get_unique_faces_from_target_video() -> Any:
     try:
         modules.globals.source_target_map = []
         frame_face_embeddings = []
         face_embeddings = []
-    
+
         print('Creating temp resources...')
         clean_temp(modules.globals.target_path)
         create_temp(modules.globals.target_path)
@@ -297,7 +333,7 @@ def get_unique_faces_from_target_video() -> Any:
 
             for face in many_faces:
                 face_embeddings.append(face.normed_embedding)
-            
+
             frame_face_embeddings.append({'frame': i, 'faces': many_faces, 'location': temp_frame_path})
             i += 1
 
@@ -319,11 +355,10 @@ def get_unique_faces_from_target_video() -> Any:
 
             modules.globals.source_target_map[i]['target_faces_in_frame'] = temp
 
-        # dump_faces(centroids, frame_face_embeddings)
         default_target_face()
     except ValueError:
         return None
-    
+
 
 def default_target_face():
     for map in modules.globals.source_target_map:
@@ -336,7 +371,7 @@ def default_target_face():
                 break
 
         if best_face is None:
-            continue  # No faces detected in this cluster — skip
+            continue
 
         for frame in map['target_faces_in_frame']:
             for face in frame['faces']:
